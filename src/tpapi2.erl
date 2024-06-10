@@ -32,6 +32,7 @@
          connect/1,
          do_get/2
         ]).
+-export([do_download/4]).
 
 -export([search_tx_by_txid/2]).
 
@@ -102,19 +103,19 @@ iterate_blocks(ConnPid, BlkID, TxID, TxTime) ->
       case jsx:decode(Body,[return_maps]) of
         #{<<"ok">> := true,
           <<"block">>:=#{
-                         <<"header">>:=#{
-                                         <<"roots">>:=#{
-                                                        <<"mean_time">>:=HexBlockTime
-                                                       }
-                                        },
-                         <<"txs_ids">>:=Success,
-                         <<"failed">>:=Failed
-                        }=Blk} ->
+           <<"header">>:=#{
+            <<"roots">>:=#{
+             <<"mean_time">>:=HexBlockTime
+            }
+           },
+           <<"txs_ids">>:=Success,
+           <<"failed">>:=Failed
+          }=Blk} ->
           case lists:member(TxID,Success) of
             true ->
               {found, {success, BlkID}};
-            false ->
-              case lists:member(TxID,Failed) of
+            false when is_map(Failed) ->
+              case maps:is_key(TxID,Failed) of
                 true ->
                   {found, {failed, BlkID}};
                 false ->
@@ -127,6 +128,16 @@ iterate_blocks(ConnPid, BlkID, TxID, TxTime) ->
                     true ->
                       iterate_blocks(ConnPid, maps:get(<<"child">>,Blk), TxID, TxTime)
                   end
+              end;
+            false ->
+              BlockTime=binary:decode_unsigned(hex:decode(HexBlockTime)),
+              case maps:is_key(<<"child">>,Blk) of
+                false ->
+                  not_found;
+                true when BlockTime-TxTime>900000 ->
+                  not_found;
+                true ->
+                  iterate_blocks(ConnPid, maps:get(<<"child">>,Blk), TxID, TxTime)
               end
           end;
         Other ->
@@ -193,6 +204,46 @@ do_get1(ConnPid, Endpoint) ->
     true ->
       {Code, Headers, <<>>}
   end.
+
+do_download(ConnPid, Endpoint, ReqHeaders, Filename) ->
+  StreamRef = gun:get(ConnPid, Endpoint, ReqHeaders),
+  {response, Fin, Code, Headers} = gun:await(ConnPid, StreamRef),
+  if Code == 200 andalso Fin==fin ->
+       {Code, Headers, no_data};
+     Code == 200 ->
+       {ok, Fd} = file:open(Filename, [raw, write, delayed_write, binary]),
+       R=await_body(ConnPid, StreamRef, Fd),
+       file:close(Fd),
+      {Code, Headers, R};
+    true ->
+      {Code, Headers, <<>>}
+  end.
+
+await_body(ServerPid, StreamRef, FileHandle) ->
+	MRef = monitor(process, ServerPid),
+	Res = await_body(ServerPid, StreamRef, 5000, MRef, FileHandle),
+	demonitor(MRef, [flush]),
+	Res.
+
+await_body(ServerPid, StreamRef, Timeout, MRef, Handler) ->
+	receive
+		{gun_data, ServerPid, StreamRef, nofin, Data} ->
+      ok = file:write(Handler, Data),
+			await_body(ServerPid, StreamRef, Timeout, MRef, Handler);
+		{gun_data, ServerPid, StreamRef, fin, Data} ->
+      ok = file:write(Handler, Data),
+			ok;
+    {gun_error, ServerPid, StreamRef, Reason} ->
+			{error, Reason};
+		{gun_error, ServerPid, Reason} ->
+			{error, Reason};
+		{'DOWN', MRef, process, ServerPid, Reason} ->
+			{error, Reason}
+	after Timeout ->
+		{error, timeout}
+	end.
+
+
 
 submit_tx(Node, Tx) ->
   submit_tx(Node, Tx, []).
@@ -263,9 +314,9 @@ wait_tx(ConnPid0, TxID, Timeout) ->
              #{<<"res">> := null, <<"ok">> := true} ->
                timer:sleep(1000),
                wait_tx(ConnPid, TxID, Timeout);
-             #{<<"res">>:= Result, <<"ok">> := true} ->
+             #{<<"res">>:= RResult, <<"ok">> := true} when is_map(RResult)->
                fin_or_keep(ConnPid0, ConnPid),
-               {ok, Result#{<<"txid">> => TxID}};
+               {ok, RResult#{<<"txid">> => TxID}};
              Other ->
                fin_or_keep(ConnPid0, ConnPid),
                {error, Other}
